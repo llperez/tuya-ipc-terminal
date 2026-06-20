@@ -489,8 +489,46 @@ func (s *RTSPServer) handlePlay(client *RTSPClient, request *RTSPRequest) {
 		"RTP-Info": fmt.Sprintf("url=%s;seq=1;rtptime=0", request.URL),
 	}
 
-	sendRTSPResponse(client.conn, 200, "OK", headers, "")
+	// BLOCK on WebRTC readiness before answering PLAY.
+	// Returning 200 OK before a media source exists causes 0-packet streams; returning
+	// 503 quickly causes gaps because ffmpeg/backends don't retry well.
+	if client.stream == nil {
+		core.Logger.Error().Msgf("PLAY has nil stream: session=%s camera=%s", client.session, client.cameraPath)
+		sendRTSPResponse(client.conn, 500, "Internal Server Error", map[string]string{
+			"CSeq":    strconv.Itoa(request.CSeq),
+			"Session": client.session,
+		}, "no stream")
+		return
+	}
+	core.Logger.Trace().Msgf(
+		"PLAY gating: session=%s camera=%s streamId=%s stream=%p webrtc=%p active=%v connecting=%v webrtc_connected=%v",
+		client.session,
+		client.cameraPath,
+		client.stream.streamId,
+		client.stream,
+		client.stream.webrtcBridge,
+		client.stream.active,
+		client.stream.connecting,
+		func() bool { if client.stream.webrtcBridge == nil { return false }; return client.stream.webrtcBridge.IsConnected() }(),
+	)
+	if ok := client.stream.EnsureStarted(45 * time.Second); !ok {
+		core.Logger.Error().Msgf(
+			"WebRTC stream not ready after wait: session=%s camera=%s streamId=%s active=%v connecting=%v webrtc_connected=%v",
+			client.session,
+			client.cameraPath,
+			client.stream.streamId,
+			client.stream.active,
+			client.stream.connecting,
+			func() bool { if client.stream.webrtcBridge == nil { return false }; return client.stream.webrtcBridge.IsConnected() }(),
+		)
+		sendRTSPResponse(client.conn, 503, "Service Unavailable", map[string]string{
+			"CSeq":    strconv.Itoa(request.CSeq),
+			"Session": client.session,
+		}, "stream not ready")
+		return
+	}
 
+	sendRTSPResponse(client.conn, 200, "OK", headers, "")
 	core.Logger.Info().Msgf("Starting RTSP stream for client %s", client.session)
 }
 
@@ -503,6 +541,20 @@ func (s *RTSPServer) handleTeardown(client *RTSPClient, request *RTSPRequest) {
 	sendRTSPResponse(client.conn, 200, "OK", headers, "")
 
 	core.Logger.Info().Msgf("Tearing down RTSP stream for client %s", client.session)
+	if client.stream != nil {
+		// Tuya WebRTC streams can wedge after the first client disconnects,
+		// especially Pasillo. Avoid CameraStream locks here; teardown can race with
+		// RTP forwarding and otherwise leave the server reusing a stale stream.
+		stream := client.stream
+		go func() {
+			// Use the stream's internal stop logic so we also reset readiness state
+			// (readyCh/startOnce) and avoid getting stuck in a state where PLAY never
+			// triggers a new WebRTC start.
+			stream.mutex.Lock()
+			stream.stopStreamInternal()
+			stream.mutex.Unlock()
+		}()
+	}
 }
 
 func (s *RTSPServer) handleUnsupportedMethod(client *RTSPClient, request *RTSPRequest) {
@@ -534,8 +586,14 @@ func (s *RTSPServer) generateSDP(camera *storage.CameraInfo, baseURL string) str
 
 	// Video media description based on skill
 	if skill != nil && len(skill.Videos) > 0 {
-		// HD (main) as default
-		streamType := tuya.GetStreamType(skill, "hd")
+		// Match the SDP codec to the requested endpoint (/hd or /sd). The upstream
+		// bridge already starts WebRTC with this resolution; advertising HD here for
+		// /sd makes ffmpeg try to parse H265 while the camera is sending H264.
+		streamResolution := "hd"
+		if strings.Contains(baseURL, "/sd") {
+			streamResolution = "sd"
+		}
+		streamType := tuya.GetStreamType(skill, streamResolution)
 		isHEVC := tuya.IsHEVC(skill, streamType)
 
 		var videoInfo *tuya.VideoSkill
@@ -567,7 +625,7 @@ func (s *RTSPServer) generateSDP(camera *storage.CameraInfo, baseURL string) str
 	}
 
 	videoSdp += fmt.Sprintf("a=control:%s/video\r\n", baseURL)
-	videoSdp += "a=recvonly\r\n"
+	videoSdp += "a=sendonly\r\n"
 
 	// Audio media description based on skill
 	if skill != nil && len(skill.Audios) > 0 {
@@ -594,14 +652,13 @@ func (s *RTSPServer) generateSDP(camera *storage.CameraInfo, baseURL string) str
 		audioSdp += "a=rtpmap:0 PCMU/8000\r\n"
 	}
 
-	backchannelAudio := audioSdp
-	backchannelAudio += fmt.Sprintf("a=control:%s/backchannel\r\n", baseURL)
-	backchannelAudio += "a=sendonly\r\n"
-
 	audioSdp += fmt.Sprintf("a=control:%s/audio\r\n", baseURL)
-	audioSdp += "a=recvonly\r\n"
+	audioSdp += "a=sendonly\r\n"
 
-	finalSdp := sdp + videoSdp + audioSdp + backchannelAudio
+	// Do not advertise the talk-back/backchannel track to normal RTSP clients.
+	// Clients like ffmpeg/VLC do not need it, and SETUP on a send-only audio
+	// backchannel can make simple recording flows brittle.
+	finalSdp := sdp + videoSdp + audioSdp
 
 	return finalSdp
 }

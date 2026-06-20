@@ -140,6 +140,7 @@ func (c *MQTTClient) consume(client mqtt.Client, msg mqtt.Message) {
 	case "candidate":
 		cameraClient.onMqttCandidate(&rmqtt)
 	case "disconnect":
+		core.Logger.Warn().RawJSON("payload", msg.Payload()).Msg("Camera sent disconnect")
 		cameraClient.onMqttDisconnect()
 	}
 }

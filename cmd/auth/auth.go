@@ -537,7 +537,9 @@ func performQRAuthentication(region tuya.Region, email string) (*tuya.SessionDat
 		return nil, fmt.Errorf("error generating QR code: %v", err)
 	}
 
-	qrterminal.Generate("tuyaSmart--qrLogin?token="+qrCodeToken, qrterminal.L, os.Stdout)
+	qrPayload := "tuyaSmart--qrLogin?token=" + qrCodeToken
+	_ = os.WriteFile(".run/qr_payload.txt", []byte(qrPayload), 0600)
+	qrterminal.Generate(qrPayload, qrterminal.L, os.Stdout)
 	fmt.Printf("\nPlease scan the QR code with the Tuya Smart / Smart Life app.\n")
 	fmt.Printf("Make sure to use the account with email: %s\n", email)
 	fmt.Println("\nPress Enter after scanning to continue...")
@@ -549,7 +551,7 @@ func performQRAuthentication(region tuya.Region, email string) (*tuya.SessionDat
 		return nil, fmt.Errorf("error polling for login: %v", err)
 	}
 
-	if loginResult.Email != email {
+	if !strings.EqualFold(loginResult.Email, email) {
 		fmt.Println("Logged in with different email than expected!")
 		fmt.Printf("Expected: %s, Got: %s\n", email, loginResult.Email)
 		fmt.Println("Continue anyway? (y/N): ")

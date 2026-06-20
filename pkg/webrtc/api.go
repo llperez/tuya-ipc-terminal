@@ -50,6 +50,12 @@ func NewServerAPI(network, address string, filters *Filters) (*webrtc.API, error
 	// fix https://github.com/pion/webrtc/pull/2407
 	s.SetDTLSInsecureSkipHelloVerify(true)
 
+	// Disable mDNS candidate gathering to avoid a socket leak in pion/ice v4.0.10
+	// where closeMulticastConn() is never called from Agent.Close(), causing mDNS
+	// UDP sockets (port 5353) to accumulate indefinitely on each peer connection
+	// cycle. Not needed for local network camera streaming anyway.
+	s.SetICEMulticastDNSMode(ice.MulticastDNSModeDisabled)
+
 	if filters != nil && filters.Loopback {
 		s.SetIncludeLoopbackCandidate(true)
 	}

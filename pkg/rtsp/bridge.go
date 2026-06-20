@@ -160,7 +160,7 @@ func (wb *WebRTCBridge) Start() error {
 	}
 
 	wb.connected = true
-	core.Logger.Info().Msgf("WebRTC bridge started successfully for camera: %s", wb.camera.DeviceName)
+	core.Logger.Info().Msgf("WebRTC bridge started successfully for camera: %s (webrtc=%p)", wb.camera.DeviceName, wb)
 
 	return nil
 }
@@ -169,7 +169,33 @@ func (wb *WebRTCBridge) Stop() {
 	wb.mutex.Lock()
 	defer wb.mutex.Unlock()
 
+	// Always close peer connection, even if we never fully connected.
+	// During startup failures the peer connection is created
+	// (setupPeerConnection line 244) but `connected` at line 162 is set true
+	// only after Start() succeeds. The old guard below would skip cleanup,
+	// leaving the peer connection's ICE/STUN/TURN UDP sockets open forever.
+	// Each reconnection attempt then creates a new peer connection on top of
+	// the old dead sockets, accumulating thousands over hours.
+	if wb.peerConnection != nil {
+		wb.peerConnection.Close()
+	}
+
+	// Cancel context to stop all goroutines
+	wb.cancel()
+
+	// Always clean up MQTT client, regardless of connected state.
+	// When Start() fails (e.g. corrupt-H264 camera), connected=false and
+	// the old guard skipped MQTT stop, orphaning the MQTT connection.
+	// The next Start() overwrites wb.mqttClient with a new one, leaving
+	// the old client alive forever — still receiving Tuya cloud messages,
+	// still firing HandleAnswer/HandleCandidate callbacks that collide
+	// with the new peer connection.
+	if wb.mqttClient != nil {
+		wb.mqttClient.Stop()
+	}
+
 	if !wb.connected {
+		core.Logger.Info().Msgf("Stopping (partial) WebRTC bridge for camera: %s", wb.camera.DeviceName)
 		return
 	}
 
@@ -177,22 +203,9 @@ func (wb *WebRTCBridge) Stop() {
 
 	core.Logger.Info().Msgf("Stopping WebRTC bridge for camera: %s", wb.camera.DeviceName)
 
-	// Cancel context to stop all goroutines
-	wb.cancel()
-
 	// Send disconnect
 	if wb.cameraClient != nil {
 		wb.cameraClient.SendDisconnect()
-	}
-
-	// Close peer connection
-	if wb.peerConnection != nil {
-		wb.peerConnection.Close()
-	}
-
-	// Stop MQTT client
-	if wb.mqttClient != nil {
-		wb.mqttClient.Stop()
 	}
 
 	// Stop RTP forwarder
@@ -308,8 +321,13 @@ func (wb *WebRTCBridge) setupPeerConnection(webRTCConfig *tuya.WebRTCConfig) err
 		if state == pion.PeerConnectionStateConnected {
 			core.Logger.Info().Msgf("WebRTC connection established")
 
-			if !wb.isHEVC && wb.resolution == "hd" {
-				_ = wb.cameraClient.SendResolution(0)
+			if !wb.isHEVC {
+				// For non-HEVC streams, consider the bridge ready as soon as the peer
+				// connection is established. The SDP/RTSP side needs Start() to return so
+				// PLAY can block correctly and clients don't get 503/0-packet streams.
+				if wb.resolution == "hd" {
+					_ = wb.cameraClient.SendResolution(0)
+				}
 				wb.waiter.Done(nil)
 			}
 		}

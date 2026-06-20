@@ -260,8 +260,8 @@ func (rf *RTPForwarder) RemoveClient(sessionID string) {
 }
 
 func (rf *RTPForwarder) ForwardVideoPacket(packet *rtp.Packet) {
-	rf.mutex.RLock()
-	defer rf.mutex.RUnlock()
+	rf.mutex.Lock()
+	defer rf.mutex.Unlock()
 
 	if len(rf.clients) == 0 {
 		return
@@ -292,6 +292,8 @@ func (rf *RTPForwarder) ForwardVideoPacket(packet *rtp.Packet) {
 			if client.tcpConn != nil {
 				if err := rf.sendInterleavedRTP(client.tcpConn, client.videoRTPChannel, data); err != nil {
 					core.Logger.Error().Err(err).Msgf("Error forwarding video packet to TCP client %s", sessionID)
+					client.tcpConn.Close()
+					delete(rf.clients, sessionID)
 				} else if rf.firstVideoPacket {
 					rf.firstVideoPacket = false
 					core.Logger.Trace().Msgf("Successfully sent first video packet to TCP client %s on channel %d",
@@ -303,8 +305,8 @@ func (rf *RTPForwarder) ForwardVideoPacket(packet *rtp.Packet) {
 }
 
 func (rf *RTPForwarder) ForwardAudioPacket(packet *rtp.Packet) {
-	rf.mutex.RLock()
-	defer rf.mutex.RUnlock()
+	rf.mutex.Lock()
+	defer rf.mutex.Unlock()
 
 	if len(rf.clients) == 0 {
 		return
@@ -335,6 +337,8 @@ func (rf *RTPForwarder) ForwardAudioPacket(packet *rtp.Packet) {
 			if client.tcpConn != nil {
 				if err := rf.sendInterleavedRTP(client.tcpConn, client.audioRTPChannel, data); err != nil {
 					core.Logger.Error().Err(err).Msgf("Error forwarding audio packet to TCP client %s", sessionID)
+					client.tcpConn.Close()
+					delete(rf.clients, sessionID)
 				} else if rf.firstAudioPacket {
 					rf.firstAudioPacket = false
 					core.Logger.Trace().Msgf("Successfully sent first audio packet to TCP client %s on channel %d",

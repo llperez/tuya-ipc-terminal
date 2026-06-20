@@ -67,7 +67,19 @@ type CameraStream struct {
 	// Reference to server for cleanup
 	server   *RTSPServer
 	streamId string
+
+	// Startup coordination (avoid races where PLAY happens before WebRTC startup
+	// actually begins, leaving clients with 0 packets or spurious 503s).
+	startOnce sync.Once
+	readyCh   chan struct{} // closed when WebRTC is connected
+
+	// Retry backoff: when a corrupt-H264 camera fails WebRTC instantly, we
+	// don't want to retry every 500ms for 40s. Each attempt creates ICE
+	// candidate UDP sockets that enter TIME_WAIT, accumulating 1000+ sockets
+	// in minutes. Set this after each failure to skip retries until it passes.
+	backoffDeadline time.Time
 }
+
 
 type ServerConfig struct {
 	Port                 int
@@ -330,22 +342,30 @@ func (s *RTSPServer) getOrCreateStream(camera *storage.CameraInfo, streamResolut
 	}
 
 	// Create new stream
+	// Create new stream; connecting should only be set by startStream().
 	stream := NewCameraStream(camera, streamResolution, user, s.storageManager, s)
-	stream.connecting = true
 
 	stream.webrtcBridge.OnError = func(err error) {
-		if stream.active || stream.connecting {
-			core.Logger.Error().Err(err).Msgf("WebRTC error for camera %s", camera.DeviceName)
+		core.Logger.Error().Err(err).Msgf("WebRTC error for camera %s: stopping stream to free UDP sockets (active=%v connecting=%v)", camera.DeviceName, stream.active, stream.connecting)
 
-			// Only stop if no clients are connected
-			stream.mutex.Lock()
-			clientCount := len(stream.clients)
-			stream.mutex.Unlock()
-
-			if clientCount == 0 {
-				stream.stopStreamInternal()
-			}
-		}
+		// Always stop the stream on WebRTC failure, regardless of active
+		// clients or connection state. The dead peer connection's UDP sockets
+		// (ICE, STUN, TURN relay channels) remain open until
+		// peerConnection.Close() is called, and stopping is the only path
+		// that triggers that cleanup. Without this unconditional call, the
+		// zombie bridge accumulates thousands of UDP sockets over hours of
+		// operation, eventually bogging down the network stack.
+		//
+		// When both active=false AND connecting=false (e.g. between
+		// EnsureStarted reconnection attempts), the old guard skipped cleanup
+		// entirely, causing catastrophic socket accumulation for corrupt-H264
+		// cameras that reconnect rapidly.
+		//
+		// Active RTSP clients will reconnect through getOrCreateStream ->
+		// startStream -> new WebRTC bridge -> fresh peer connection.
+		stream.mutex.Lock()
+		stream.stopStreamInternal()
+		stream.mutex.Unlock()
 	}
 
 	s.streams[streamId] = stream
@@ -354,13 +374,20 @@ func (s *RTSPServer) getOrCreateStream(camera *storage.CameraInfo, streamResolut
 	return stream, nil
 }
 
-func (s *RTSPServer) removeStream(streamId string) {
+func (s *RTSPServer) removeStream(streamId string, expected *CameraStream) {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
-	if _, exists := s.streams[streamId]; exists {
-		delete(s.streams, streamId)
-		core.Logger.Trace().Msgf("Removed stream %s from server map", streamId)
+	if existing, exists := s.streams[streamId]; exists {
+		// Only delete if the map entry still points to the expected stream.
+		// The async goroutine in stopStreamInternal can race with
+		// getOrCreateStream, which replaces the entry for the same key.
+		// Without this guard, a stale goroutine deletes the newly created
+		// stream (Bug 1 in the 6th leak path).
+		if existing == expected || expected == nil {
+			delete(s.streams, streamId)
+			core.Logger.Trace().Msgf("Removed stream %s from server map", streamId)
+		}
 	}
 }
 
@@ -372,17 +399,23 @@ func (s *RTSPServer) addClient(client *RTSPClient) {
 
 func (s *RTSPServer) removeClient(sessionID string) {
 	s.mutex.Lock()
-	defer s.mutex.Unlock()
-
-	if client, exists := s.clients[sessionID]; exists {
-		// Remove client from stream
-		if client.stream != nil {
-			client.stream.RemoveClient(sessionID)
-		}
-
-		client.conn.Close()
+	client, exists := s.clients[sessionID]
+	if exists {
 		delete(s.clients, sessionID)
 	}
+	s.mutex.Unlock()
+
+	if !exists {
+		return
+	}
+
+	// Do not hold the server mutex while removing from the stream. Stream removal
+	// can wait for a WebRTC startup/shutdown lock, and holding the server mutex
+	// there blocks unrelated RTSP connections from being accepted/served.
+	if client.stream != nil {
+		client.stream.RemoveClient(sessionID)
+	}
+	client.conn.Close()
 }
 
 func (s *RTSPServer) printAvailableEndpoints() error {
@@ -454,6 +487,7 @@ func NewCameraStream(camera *storage.CameraInfo, resolution string, user *storag
 		shutdownDelay: 5 * time.Second,
 		server:        server,
 		streamId:      fmt.Sprintf("%s-%s", camera.DeviceID, resolution),
+		readyCh:       make(chan struct{}),
 	}
 
 	stream.webrtcBridge = NewWebRTCBridge(camera, resolution, user, storageManager)
@@ -516,23 +550,68 @@ func (cs *CameraStream) Stop() {
 }
 
 func (cs *CameraStream) startStream() {
+	// IMPORTANT: do not hold cs.mutex while doing the potentially long-running
+	// WebRTC startup. Holding the mutex blocks AddClient/RTSP request handling and
+	// can make the RTSP server appear hung (e.g. /sd OPTIONS never gets a response).
 	cs.mutex.Lock()
-	defer cs.mutex.Unlock()
-
-	if cs.active {
+	if cs.active || cs.connecting {
+		cs.mutex.Unlock()
 		return
 	}
+	// Respect retry backoff: if WebRTC failed recently (corrupt H264), skip
+	// this attempt. The caller should try again after the deadline passes.
+	if time.Now().Before(cs.backoffDeadline) {
+		core.Logger.Debug().Msgf("Skipping startStream for %s — retry backoff active until %v", cs.camera.DeviceName, cs.backoffDeadline)
+		cs.mutex.Unlock()
+		return
+	}
+	cs.connecting = true
+	cs.mutex.Unlock()
 
-	core.Logger.Info().Msgf("Starting stream for camera: %s", cs.camera.DeviceName)
+	core.Logger.Info().Msgf("Starting stream for camera: %s (streamId=%s webrtc=%p)", cs.camera.DeviceName, cs.streamId, cs.webrtcBridge)
 
-	if err := cs.webrtcBridge.Start(); err != nil {
-		core.Logger.Error().Err(err).Msg("Failed to start WebRTC bridge")
+	// Guard against wedging forever inside WebRTC startup.
+	// If this hangs, the RTSP side gets stuck with connecting=true and PLAY will 503 indefinitely.
+	startErrCh := make(chan error, 1)
+	go func() {
+		startErrCh <- cs.webrtcBridge.Start()
+	}()
+
+	select {
+	case err := <-startErrCh:
+		if err != nil {
+			core.Logger.Error().Err(err).Msg("Failed to start WebRTC bridge")
+			cs.mutex.Lock()
+			// Set retry backoff: don't try again for 30s so corrupt
+			// cameras don't burn through ICE candidate sockets in a
+			// tight spin loop. Each attempt allocates UDP sockets
+			// that enter TIME_WAIT — enough cycles and they pile up.
+			cs.backoffDeadline = time.Now().Add(30 * time.Second)
+			cs.stopStreamInternal()
+			cs.mutex.Unlock()
+			return
+		}
+	case <-time.After(40 * time.Second):
+		core.Logger.Error().Msgf("Timed out starting WebRTC bridge for camera: %s", cs.camera.DeviceName)
+		cs.mutex.Lock()
 		cs.stopStreamInternal()
+		cs.mutex.Unlock()
 		return
 	}
 
+	cs.mutex.Lock()
 	cs.connecting = false
 	cs.active = true
+	readyCh := cs.readyCh
+	cs.mutex.Unlock()
+
+	// Signal readiness (WebRTC is connected and stream is active)
+	select {
+	case <-readyCh:
+		// already closed
+	default:
+		close(readyCh)
+	}
 }
 
 func (cs *CameraStream) stopStream() {
@@ -567,10 +646,17 @@ func (cs *CameraStream) stopStreamInternal() {
 		cs.webrtcBridge.Stop()
 	}
 
+	// Reset readiness channel for future starts
+	cs.readyCh = make(chan struct{})
+	cs.startOnce = sync.Once{}
+
 	// Remove from server map in a separate goroutine to avoid potential deadlock
+	// with cleanupInactiveStreams which holds s.mutex and calls Stop().
+	// Pass cs as the expected pointer so stale goroutines can't delete a
+	// newer stream that replaced this entry (Bug 1 fix).
 	go func() {
 		if cs.server != nil {
-			cs.server.removeStream(cs.streamId)
+			cs.server.removeStream(cs.streamId, cs)
 		}
 	}()
 }
@@ -600,4 +686,71 @@ func (cs *CameraStream) scheduleShutdown() {
 
 		cs.shutdownTimer = nil
 	})
+}
+
+// EnsureStarted makes sure the underlying WebRTC bridge is running.
+// This avoids answering RTSP PLAY before we actually have a media source.
+func (cs *CameraStream) EnsureStarted(timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		cs.mutex.Lock()
+		active := cs.active
+		connecting := cs.connecting
+		wb := cs.webrtcBridge
+		readyCh := cs.readyCh
+		cs.mutex.Unlock()
+
+		// Ready as soon as WebRTC is connected (or stream marked active).
+		if active {
+			return true
+		}
+		if wb != nil && wb.IsConnected() {
+			return true
+		}
+
+		// Kick off startup if nothing is running.
+		if !connecting {
+			cs.mutex.Lock()
+			inBackoff := time.Now().Before(cs.backoffDeadline)
+			cs.mutex.Unlock()
+			if inBackoff {
+				// In retry backoff after a recent failure; wait for it to expire
+				// rather than spawning another PeerConnection/ICE cycle that will
+				// just create TIME_WAIT sockets and fail again.
+				if deadline.After(time.Now()) {
+					select {
+					case <-readyCh:
+						return true
+					case <-time.After(500 * time.Millisecond):
+						continue
+					}
+				}
+			}
+			// Rate-limit: wait 500ms after spawning startStream to avoid
+			// creating 10 PeerConnections/sec when a corrupt stream fails
+			// instantly. Each startStream allocates ICE candidate UDP sockets
+			// that enter TIME_WAIT on close, accumulating 1000+ sockets in
+			// seconds without this backoff.
+			go cs.startStream()
+			if deadline.After(time.Now()) {
+				select {
+				case <-readyCh:
+					return true
+				case <-time.After(500 * time.Millisecond):
+					continue
+				}
+			}
+		}
+
+		if time.Now().After(deadline) {
+			return false
+		}
+
+		// Wait briefly for readiness signal, then re-check.
+		select {
+		case <-readyCh:
+			return true
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
 }
