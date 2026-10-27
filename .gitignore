@@ -3,3 +3,10 @@ tuya_session_*
 .tuya-*
 .tmp
 tuya-ipc-terminal
+
+# Local runtime artifacts (e.g. .run/qr_payload.txt from auth add)
+.run/
+
+# Local `go mod vendor` snapshot; dependencies are pinned by go.sum/go.mod
+# and build.sh resolves them with `go mod tidy` + `go build`.
+vendor/
